@@ -48,120 +48,133 @@ class PythonProgram:
   def __init__(self, name:str, lib:bytes):
     self.uops: List[Tuple[UOps, Optional[DType], List[int], Any]] = pickle.loads(lib)
   def __call__(self, *bufs, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1), vals:Tuple[int, ...]=(), wait=False):
-    st = time.perf_counter()
+    start_time = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
+    for op in self.uops:
+      print(op)
+    print("---")
     for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
-      ul: Dict[int, Any] = {}
-      dl: Dict[int, DType] = {}
+      data_list: Dict[int, Any] = {}
+      datatype_list: Dict[int, DType] = {}
       pbufs: List[memoryview] = list(bufs)
       i = 0
       loop_ends: Dict[int, int] = {}
       while i < len(self.uops):
-        uop, dtype, idp, arg = self.uops[i]
-        inp = [ul[v] for v in idp]
-        dtp = [dl[v] for v in idp]
-        if getenv("TRACE"): print(i, uop, dtype, arg, inp, dtp)
-        if uop is UOps.STORE:
-          assert len(inp) <= 3, "gated stores not supported yet"
-          if isinstance(dtp[0], ImageDType):
+        uop, dtype, data_indices, arg = self.uops[i]
+        print(i)
+        print(self.uops[i])
+        print(data_list.keys())
+        input = [data_list[v] for v in data_indices]
+        datatypes = [datatype_list[v] for v in data_indices]
+        if getenv("TRACE"): print(i, uop, dtype, arg, input, datatypes)
+
+        if uop in [UOps.END, UOps.BARRIER, UOps.STORE, UOps.IF]:
+          assert dtype is None
+          dtype = datatype_list[data_indices[0]]
+        assert dtype is not None, f"{uop} is missing a dtype"
+        datatype_list[i] = dtype
+
+        if uop is UOps.DEFINE_GLOBAL:
+          assert dtype.fmt is not None
+          data_list[i] = [pbufs.pop(0).cast(dtype.fmt)] * warp_size
+        elif uop is UOps.DEFINE_LOCAL:
+          assert dtype.fmt is not None
+          lbuf = memoryview(bytearray(arg[1]*dtype.itemsize))
+          data_list[i] = [lbuf.cast(dtype.fmt)] * warp_size
+        elif uop is UOps.BARRIER:
+          # in the python emulator, the warp is always in sync
+          data_list[i] = data_list[i - 1]
+          i += 1
+          continue
+        elif uop is UOps.STORE:
+          assert len(input) <= 3, "gated stores not supported yet"
+          if isinstance(datatypes[0], ImageDType):
             # image store
-            assert dtp[2].sz == 4
-            for j,val in enumerate(inp[2]):
-              for m,ox,oy,v in zip(inp[0], inp[1][0], inp[1][1], val):
-                assert ox >= 0 and ox < dtp[0].shape[1] and oy >= 0 and oy < dtp[0].shape[0]
-                _store(m, ox*4 + oy*dtp[0].shape[1]*4 + j, v)
-          elif dtp[2].sz > 1:
-            for j,val in enumerate(inp[2]):
-              for m,o,v in zip(inp[0], inp[1], val): _store(m, o+j, v)
+            assert datatypes[2].sz == 4
+            for j, val in enumerate(input[2]):
+              for m, ox, oy, v in zip(input[0], input[1][0], input[1][1], val):
+                assert ox >= 0 and ox < datatypes[0].shape[1] and oy >= 0 and oy < datatypes[0].shape[0]
+                _store(m, ox * 4 + oy * datatypes[0].shape[1] * 4 + j, v)
+          elif datatypes[2].sz > 1:
+            for j, val in enumerate(input[2]):
+              for m, o, v in zip(input[0], input[1], val): _store(m, o + j, v)
           else:
-            for m,o,v in zip(*inp): _store(m, o, v)
+            for m, o, v in zip(*input): _store(m, o, v)
+          data_list[i] = m
           i += 1
           continue
         elif uop is UOps.END:
-          loop_ends[idp[0]] = i
-          i = idp[0]
+          loop_ends[data_indices[0]] = i
+          i = data_indices[0]
           continue
-        elif uop is UOps.BARRIER:
-          # in the python emulator, the warp is always in sync
-          i += 1
-          continue
-        assert dtype is not None, f"{uop} is missing a dtype"
-        dl[i] = dtype
-        if uop is UOps.DEFINE_GLOBAL:
-          assert dtype.fmt is not None
-          ul[i] = [pbufs.pop(0).cast(dtype.fmt)] * warp_size
-        elif uop is UOps.DEFINE_LOCAL:
-          assert dtype.fmt is not None
-          lbuf = memoryview(bytearray(arg[1]*dtype.sz))
-          ul[i] = [lbuf.cast(dtype.fmt)] * warp_size
         elif uop is UOps.SPECIAL:
           if arg[1][0] == 'g':
-            ul[i] = [idxs[2-arg[0]]] * warp_size
+            data_list[i] = [idxs[2-arg[0]]] * warp_size
           elif arg[1][0] == 'l':
-            ul[i] = [x[2-arg[0]] for x in warp]
-        elif uop is UOps.CONST: ul[i] = [int(arg) if dtypes.is_int(dtype) else float(arg)] * warp_size
+            data_list[i] = [x[2-arg[0]] for x in warp]
+        elif uop is UOps.CONST: data_list[i] = [int(arg) if dtypes.is_int(dtype) else float(arg)] * warp_size
         elif uop is UOps.DEFINE_ACC:
           if dtype.sz > 1:
-            ul[i] = [[arg] * warp_size for _ in range(dtype.sz)]
+            data_list[i] = [[arg] * warp_size for _ in range(dtype.sz)]
           else:
-            ul[i] = [arg] * warp_size
+            data_list[i] = [arg] * warp_size
         elif uop is UOps.LOOP:
-          if i not in ul:
-            ul[i] = [0] * warp_size
+          if i not in data_list:
+            data_list[i] = [0] * warp_size
           else:
-            for j in range(len(ul[i])):
-              ul[i][j] += 1
-            if ul[i][0] == inp[1][0]:
+            for j in range(len(data_list[i])):
+              data_list[i][j] += 1
+            if data_list[i][0] == input[1][0]:
               i = loop_ends[i] + 1
               continue
         elif uop is UOps.CAST:
           if dtype.sz > 1:
-            ul[i] = inp
+            data_list[i] = input
           else:
             # TODO: add real cast
             if dtypes.is_int(dtype):
-              ul[i] = [int(x) for x in inp[0]]
+              data_list[i] = [int(x) for x in input[0]]
             elif dtypes.is_float(dtype):
-              ul[i] = [float(x) for x in inp[0]]
+              data_list[i] = [float(x) for x in input[0]]
             else:
-              ul[i] = inp[0]
+              data_list[i] = input[0]
         elif uop is UOps.LOAD:
-          if isinstance(dtp[0], ImageDType):
+          if isinstance(datatypes[0], ImageDType):
             assert dtype.sz == 4
-            ul[i] = []
+            data_list[i] = []
             for j in range(dtype.sz):
               ret = []
-              for m,ox,oy in zip(inp[0], inp[1][0], inp[1][1]):
-                if ox < 0 or ox >= dtp[0].shape[1] or oy < 0 or oy >= dtp[0].shape[0]: ret.append(0)
-                else: ret.append(_load(m, ox*4 + oy*dtp[0].shape[1]*4 + j))
-              ul[i].append(ret)
+              for m,ox,oy in zip(input[0], input[1][0], input[1][1]):
+                if ox < 0 or ox >= datatypes[0].shape[1] or oy < 0 or oy >= datatypes[0].shape[0]: ret.append(0)
+                else: ret.append(_load(m, ox*4 + oy*datatypes[0].shape[1]*4 + j))
+              data_list[i].append(ret)
           elif dtype.sz > 1:
-            ul[i] = [load(inp, j) for j in range(dtype.sz)]
+            data_list[i] = [load(input, j) for j in range(dtype.sz)]
           else:
-            ul[i] = load(inp)
+            data_list[i] = load(input)
         elif uop is UOps.PHI:
-          for j in range(len(inp[0])):
-            inp[0][j] = inp[1][j]
-          ul[i] = inp[0]
+          for j in range(len(input[0])):
+            input[0][j] = input[1][j]
+          data_list[i] = input[0]
         elif uop is UOps.GEP:
-          ul[i] = inp[0][arg]
+          data_list[i] = input[0][arg]
         elif uop is UOps.WMMA:
           # here are the models for the WMMA instruction on the different hardware
           def wmma_helper(WARP_THREADS, K, NUM_A, NUM_B, NUM_C, a_elem, b_elem, c_map):
-            assert len(inp[0]) == NUM_A, f"A must have {NUM_A} elements per thread"
-            assert len(inp[1]) == NUM_B, f"B must have {NUM_B} elements per thread"
-            assert len(inp[2]) == NUM_C, f"C must have {NUM_C} elements per thread"
-            assert len(flatten(inp[0])) == NUM_A * warp_size, f"WMMA must have {NUM_A * warp_size} total elements for A in WMMA"
-            assert len(flatten(inp[1])) == NUM_B * warp_size, f"WMMA must have {NUM_B * warp_size} total elements for B in WMMA"
-            assert len(flatten(inp[2])) == NUM_C * warp_size, f"WMMA must have {NUM_C * warp_size} total elements for C in WMMA"
+            assert len(input[0]) == NUM_A, f"A must have {NUM_A} elements per thread"
+            assert len(input[1]) == NUM_B, f"B must have {NUM_B} elements per thread"
+            assert len(input[2]) == NUM_C, f"C must have {NUM_C} elements per thread"
+            assert len(flatten(input[0])) == NUM_A * warp_size, f"WMMA must have {NUM_A * warp_size} total elements for A in WMMA"
+            assert len(flatten(input[1])) == NUM_B * warp_size, f"WMMA must have {NUM_B * warp_size} total elements for B in WMMA"
+            assert len(flatten(input[2])) == NUM_C * warp_size, f"WMMA must have {NUM_C * warp_size} total elements for C in WMMA"
             assert warp_size > 0 and warp_size % WARP_THREADS == 0, f"must have multiples of {WARP_THREADS} warp threads"
-            out = [inp[2][elem_idx][:] for elem_idx in range(NUM_C)]
+            out = [input[2][elem_idx][:] for elem_idx in range(NUM_C)]
             for goff in range(0, warp_size, WARP_THREADS):
               for lane_id in range(WARP_THREADS):
                 for elem_idx in range(NUM_C): # calculate new muls and add to acc
                   (c_i, c_j) = c_map(lane_id, elem_idx)
-                  out[elem_idx][goff+lane_id] += sum(a_elem(inp[0], _k, c_j, goff) * b_elem(inp[1], c_i, _k, goff) for _k in range(K))
+                  out[elem_idx][goff+lane_id] += sum(a_elem(input[0], _k, c_j, goff) * b_elem(input[1], c_i, _k, goff) for _k in range(K))
             return out
 
           if arg.startswith('__metal_wmma'):
@@ -169,7 +182,7 @@ class PythonProgram:
               return x[(i%2)][goff+(i//2)%2+(j%4)*2+(i//4)*8+(j//4)*16]
             def c_map(lane, elem): # (i, j), C, D (2 elements on 32 threads): row major same as A/B
               return (elem + ((lane%2)*2) + ((lane//8)%2)*4, ((lane//2)%4) + (lane//16)*4)
-            ul[i] = wmma_helper(32, 8, 2, 2, 2, a_b_elem, a_b_elem, c_map)
+            data_list[i] = wmma_helper(32, 8, 2, 2, 2, a_b_elem, a_b_elem, c_map)
           elif arg == '__builtin_amdgcn_wmma_f32_16x16x16_f16_w32' or arg == '__hip_wmma_f16_f16':
             def a_elem(x, i, j, goff): # A (16 elements on 32 threads): col major, lane 16-32 == lane 0-15
               assert x[i][goff+j] == x[i][goff+j+16], "warp elements not duplicated properly across lanes"
@@ -177,16 +190,16 @@ class PythonProgram:
             def b_elem(x, i, j, goff): # B (16 elements on 32 threads): row major, lane 16-32 == lane 0-15
               return a_elem(x, j, i, goff)
             def c_map(lane, elem): return (lane%16, lane//16+elem*2) # (i, j), C, D (8 elements on 32 threads): row major
-            ul[i] = wmma_helper(32, 16, 16, 16, 8, a_elem, b_elem, c_map)
+            data_list[i] = wmma_helper(32, 16, 16, 16, 8, a_elem, b_elem, c_map)
           else:
             raise Exception(f"unimplemented tensor core {arg}")
         elif uop is UOps.ALU:
-          assert all_same([len(x) for x in inp]), f"{[len(x) for x in inp]} doesn't match on {arg}"
-          assert all_same([dtype] + dtp) or arg in {BinaryOps.CMPEQ, BinaryOps.CMPLT, TernaryOps.WHERE}, f"dtype mismatch on {arg}"
-          ul[i] = [exec_alu(arg, dtype, p) for p in zip(*inp)]
-        assert i in ul, (uop, dtype, idp, arg)
+          assert all_same([len(x) for x in input]), f"{[len(x) for x in input]} doesn't match on {arg}"
+          assert all_same([dtype] + datatypes) or arg in {BinaryOps.CMPEQ, BinaryOps.CMPLT, TernaryOps.WHERE}, f"dtype mismatch on {arg}"
+          data_list[i] = [exec_alu(arg, dtype, p) for p in zip(*input)]
+        assert i in data_list, (uop, dtype, data_indices, arg)
         i += 1
-    return time.perf_counter() - st
+    return time.perf_counter() - start_time
 
 class PythonCompiler(Compiler):
   linearizer_opts = LinearizerOptions("METAL", has_tensor_cores=True) if getenv("EMULATE_METAL") else \
